@@ -66,6 +66,7 @@ static uint64_t   s_os_pick_ms_sum  = 0;
 static uint32_t   s_os_pick_samples = 0;
 static uint64_t   s_os_sess_start_us = 0;
 static bool       s_os_active       = false;
+static bool       s_os_todas        = false; /* OS separar tudo: total vem do braco (os_total) */
 static lv_timer_t *s_os_pick_timer  = NULL;
 
 /* Sessao: true enquanto o utilizador esta autenticado (dashboard visivel).
@@ -97,6 +98,8 @@ typedef enum {
     CMD_CATALOG_ITEM = 7,
     CMD_CATALOG_END  = 8,
     CMD_UNIT_DONE    = 9,   /* software confirmou coleta de 1 remedio */
+    CMD_UNIT         = 10,  /* total ABSOLUTO de separadas */
+    CMD_OS_TOTAL     = 11,  /* braco contou as caixas: total da OS "todas" */
 } serial_cmd_type_t;
 
 typedef struct {
@@ -104,6 +107,9 @@ typedef struct {
     char     num   [OS_NUM_BUF_SZ];
     char     client[OS_CLIENT_BUF_SZ];
     uint32_t total;
+    uint32_t done;
+    bool     has_done;
+    bool     todas;
     char     reason[OS_HIST_MOTIVO_SZ];
 } serial_cmd_t;
 
@@ -966,6 +972,9 @@ static void ui_os_paint_labels(void)
         if (s_os_active && s_os_meds_total > 0) {
             lv_label_set_text_fmt(s_lbl_os_meds, "%lu / %lu  separados",
                                   (unsigned long)s_os_meds_done, (unsigned long)s_os_meds_total);
+        } else if (s_os_active && s_os_todas) {
+            lv_label_set_text_fmt(s_lbl_os_meds, "%lu separados (contando...)",
+                                  (unsigned long)s_os_meds_done);
         } else {
             lv_label_set_text(s_lbl_os_meds, "-- / --  separados");
         }
@@ -983,6 +992,8 @@ static void ui_os_paint_labels(void)
     if (s_lbl_os_eta) {
         if (!s_os_active) {
             lv_label_set_text(s_lbl_os_eta, "--");
+        } else if (s_os_meds_total == 0) {
+            lv_label_set_text(s_lbl_os_eta, "Estimativa: --");
         } else if (s_os_meds_total <= s_os_meds_done) {
             lv_label_set_text(s_lbl_os_eta, "Concluido");
         } else if (s_os_pick_samples == 0) {
@@ -2065,6 +2076,7 @@ static void os_reset_idle(void)
     s_os_client_str[0]    = '\0';
     s_os_meds_total       = 0;
     s_os_meds_done        = 0;
+    s_os_todas            = false;
     s_os_pick_ms_sum      = 0;
     s_os_pick_samples     = 0;
     s_os_sess_start_us    = 0;
@@ -2130,8 +2142,9 @@ static void serial_bridge_os_start(const char *num, const char *client, uint32_t
                BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total, items_buf);
     } else {
         printf("BRIDGE:{\"ev\":\"os_start\",\"robot\":\"%s\",\"num\":\"%s\","
-               "\"client\":\"%s\",\"total\":%lu}\n",
-               BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total);
+               "\"client\":\"%s\",\"total\":%lu%s}\n",
+               BRIDGE_ROBOT_CODE, en, ec, (unsigned long)total,
+               s_os_todas ? ",\"todas\":true" : "");
     }
 }
 
@@ -2278,6 +2291,8 @@ static void serial_cmd_task(void *arg)
         else if (strstr(p, "\"ping\""))        { cmd.type = CMD_PING;        }
         else if (strstr(p, "\"set_device\"")) { cmd.type = CMD_SET_DEVICE;  }
         else if (strstr(p, "\"unit_done\""))  { cmd.type = CMD_UNIT_DONE;   }
+        else if (strstr(p, "\"unit\""))       { cmd.type = CMD_UNIT;        }
+        else if (strstr(p, "\"os_total\""))   { cmd.type = CMD_OS_TOTAL;    }
         else { continue; }
 
         /* Extrai strings: procura "chave":"valor"
@@ -2309,6 +2324,19 @@ static void serial_cmd_task(void *arg)
             }
         }
 
+        /* Extrai "done": total absoluto de separadas (opcional) */
+        {
+            char *d = strstr(p, "\"done\":");
+            if (d) {
+                d += 7;
+                cmd.done     = (uint32_t)strtoul(d, NULL, 10);
+                cmd.has_done = true;
+            }
+        }
+
+        /* Extrai "todas": true -> OS separar tudo */
+        cmd.todas = (strstr(p, "\"todas\":true") != NULL);
+
         xQueueSend(s_cmd_queue, &cmd, 0);
         APP_INFO("[CMD RX] tipo=%d num='%s'", cmd.type, cmd.num);
     }
@@ -2324,15 +2352,20 @@ static void serial_cmd_timer_cb(lv_timer_t *t)
         s_bridge_suppress = true;  /* nao reemitir o evento de volta */
 
         if (cmd.type == CMD_OS_ASSIGN) {
-            if (!s_os_active && cmd.num[0] && cmd.total > 0) {
-                APP_INFO("[CMD] os_assign: %s / %s / %lu", cmd.num, cmd.client, (unsigned long)cmd.total);
-                os_start_manual(cmd.num, cmd.client, cmd.total);
+            if (!s_os_active && cmd.num[0] && (cmd.total > 0 || cmd.todas)) {
+                APP_INFO("[CMD] os_assign: %s / %s / %lu%s", cmd.num, cmd.client,
+                         (unsigned long)cmd.total, cmd.todas ? " (todas)" : "");
+                s_os_todas = cmd.todas;
+                os_start_manual(cmd.num, cmd.client, cmd.todas ? 0 : cmd.total);
             } else {
                 APP_WARN("[CMD] os_assign ignorado (OS ja ativa ou dados invalidos)");
             }
         } else if (cmd.type == CMD_OS_COMPLETE) {
             if (s_os_active) {
                 APP_INFO("[CMD] os_complete: %s", cmd.num);
+                if (cmd.has_done && cmd.done > s_os_meds_done) {
+                    s_os_meds_done = cmd.done;
+                }
                 os_finalize_concluida();
             }
         } else if (cmd.type == CMD_OS_CANCEL) {
@@ -2350,6 +2383,34 @@ static void serial_cmd_timer_cb(lv_timer_t *t)
             if (s_os_active && s_os_paused) {
                 APP_INFO("[CMD] os_resume: %s", cmd.num);
                 os_resume();
+            }
+        } else if (cmd.type == CMD_UNIT) {
+            /* Total absoluto vindo do sistema: nunca diminui, sem eco BRIDGE */
+            if (s_os_active && cmd.has_done &&
+                (cmd.num[0] == '\0' || strcmp(cmd.num, s_os_num_str) == 0) &&
+                cmd.done > s_os_meds_done) {
+                uint64_t now_us = esp_timer_get_time();
+                if (s_os_meds_done > 0 && s_os_sess_start_us > 0) {
+                    uint32_t elapsed_ms = (uint32_t)((now_us - s_os_sess_start_us) / 1000ULL);
+                    s_os_pick_ms_sum += (uint64_t)(elapsed_ms / s_os_meds_done);
+                    s_os_pick_samples++;
+                }
+                s_os_meds_done = cmd.done;
+                if (s_os_meds_total > 0 && s_os_meds_total < s_os_meds_done) {
+                    s_os_meds_total = s_os_meds_done;
+                }
+                APP_INFO("[CMD] unit: %lu/%lu", (unsigned long)s_os_meds_done,
+                         (unsigned long)s_os_meds_total);
+                ui_os_paint_labels();
+                if (!s_os_todas && s_os_meds_total > 0 && s_os_meds_done >= s_os_meds_total) {
+                    os_finalize_concluida();
+                }
+            }
+        } else if (cmd.type == CMD_OS_TOTAL) {
+            if (s_os_active && (cmd.num[0] == '\0' || strcmp(cmd.num, s_os_num_str) == 0)) {
+                s_os_meds_total = cmd.total < s_os_meds_done ? s_os_meds_done : cmd.total;
+                APP_INFO("[CMD] os_total: %lu", (unsigned long)s_os_meds_total);
+                ui_os_paint_labels();
             }
         } else if (cmd.type == CMD_UNIT_DONE) {
             /* Software confirmou coleta de 1 remédio */
@@ -2370,7 +2431,7 @@ static void serial_cmd_timer_cb(lv_timer_t *t)
                     /* Envia progresso de volta ao gateway */
                     serial_bridge_unit(s_os_num_str, s_os_meds_done);
                     /* Checa conclusão automática quando total é conhecido */
-                    if (s_os_meds_total > 0 && s_os_meds_done >= s_os_meds_total) {
+                    if (!s_os_todas && s_os_meds_total > 0 && s_os_meds_done >= s_os_meds_total) {
                         os_finalize_concluida();
                     }
                 }
@@ -2539,8 +2600,9 @@ static void os_finalize_concluida(void)
     }
     char num_copy[OS_NUM_BUF_SZ];
     str_copy_trunc(num_copy, sizeof num_copy, s_os_num_str);
-    uint32_t done_snap = s_os_meds_total;
-    historico_push(s_os_num_str, s_os_client_str, s_os_meds_total, s_os_meds_total, 0,
+    uint32_t done_snap = s_os_meds_done;
+    historico_push(s_os_num_str, s_os_client_str, done_snap,
+                   s_os_meds_total > done_snap ? s_os_meds_total : done_snap, 0,
                    OS_HIST_CONCLUIDA, NULL);
     os_reset_idle();
     serial_bridge_os_complete(num_copy, done_snap);
@@ -2563,7 +2625,8 @@ static void os_finalize_cancelada(const char *motivo)
     char num_copy[OS_NUM_BUF_SZ];
     str_copy_trunc(num_copy, sizeof num_copy, s_os_num_str);
     uint32_t done_snap = s_os_meds_done;
-    historico_push(s_os_num_str, s_os_client_str, s_os_meds_done, s_os_meds_total, 0,
+    historico_push(s_os_num_str, s_os_client_str, s_os_meds_done,
+                   s_os_meds_total > 0 ? s_os_meds_total : s_os_meds_done, 0,
                    OS_HIST_CANCELADA, motivo);
     os_reset_idle();
     serial_bridge_os_cancel(num_copy, done_snap, motivo);
@@ -2700,7 +2763,8 @@ static void os_manual_iniciar_cb(lv_event_t *e)
 
     uint32_t total = 0;
 
-    if (s_os_coletar_todos) {
+    bool todas = s_os_coletar_todos;
+    if (todas) {
         /* Modo "Coletar todos": nao exige total, software define quais remedios */
         basket_clear();
         total = 0;
@@ -2713,6 +2777,7 @@ static void os_manual_iniciar_cb(lv_event_t *e)
         total = (uint32_t)basket_tot;
     }
 
+    s_os_todas = todas; /* lido por serial_bridge_os_start dentro de os_start_manual */
     os_start_manual(num, cli, total);
 }
 
