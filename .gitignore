@@ -1,0 +1,19 @@
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+managed_components/
+dependencies.lock
+.cache/
+*.bak
+
+# VS Code Espressif IDF
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+# Arquivo gerado pela conversão do logo (regenerar com: python tools/convert_logo.py)
+main/logo_aris.bin
+
+# Sistema
+Thumbs.db
+.DS_Store
