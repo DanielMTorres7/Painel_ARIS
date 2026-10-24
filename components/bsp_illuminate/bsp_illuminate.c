@@ -209,7 +209,6 @@ static esp_err_t lvgl_init(void)
 #endif
             .full_refresh = false,
             .direct_mode  = false,
-            .skip_panel_swap_xy = true,
         },
     };
 
